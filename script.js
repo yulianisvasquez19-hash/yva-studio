@@ -1,13 +1,86 @@
 "use strict";
 const KEY="yvaStudioDatosV4";
+const FIREBASE_CONFIG={apiKey:"AIzaSyAyBaMA4YRBXUW_tW3MA4lCYQrkyjhNDRc",authDomain:"yva-studio.firebaseapp.com",projectId:"yva-studio",storageBucket:"yva-studio.firebasestorage.app",messagingSenderId:"976403281076",appId:"1:976403281076:web:71d021db12484b3ad0d3e1",measurementId:"G-XEEHSYM4ZX"};
+const ALLOWED_UID="EbFhnMhh55Rdbu1B2f83ckKjjR23";
+const CLOUD_DOC_PATH="yvaStudio/main";
+let auth=null,db=null,cloudDoc=null,cloudReady=false,cloudUnsubscribe=null,suppressCloudWrite=false;
 const BASE={nombre:"YVA STUDIO",dias:25,descuentoCumple:10,largos:{corto:25,medio:35,largo:45},servicios:[{id:"builder",nombre:"Builder Gel",modo:"largo",precio:0,fijo:true},{id:"polygel",nombre:"Polygel",modo:"largo",precio:0,fijo:true},{id:"soft",nombre:"Soft Gel",modo:"largo",precio:0,fijo:true},{id:"dual",nombre:"Dual System",modo:"largo",precio:0,fijo:true},{id:"shellac",nombre:"Shellac",modo:"fijo",precio:20,fijo:true},{id:"pedi_spa",nombre:"Pedi Spa",modo:"fijo",precio:35,fijo:true},{id:"pedi_express",nombre:"Pedi Express",modo:"fijo",precio:20,fijo:true}],extras:[{id:"french",nombre:"French",precio:5,fijo:true},{id:"cateye",nombre:"Cat Eye",precio:5,fijo:true},{id:"aura",nombre:"Aura",precio:10,fijo:true},{id:"cristales",nombre:"Cristales",precio:5,fijo:true},{id:"retiro",nombre:"Retiro previo",precio:8,fijo:true}]};
 let data=load(),calendar=null,editing=null,origin=null,calcTotal=0;
-document.addEventListener("DOMContentLoaded",()=>{migrate();ensureDefaults();bind();fillServices();loadConfig();buildFortnights();initCalendar();refresh()});
+document.addEventListener("DOMContentLoaded",()=>{migrate();ensureDefaults();bind();bindAuthentication();fillServices();loadConfig();buildFortnights();initCalendar();refresh();initializeFirebase()});
 function fresh(){return{citas:[],config:JSON.parse(JSON.stringify(BASE))}}
 function load(){try{let d=JSON.parse(localStorage.getItem(KEY)||"null");return d?{citas:Array.isArray(d.citas)?d.citas:[],config:{...BASE,...d.config,largos:{...BASE.largos,...(d.config?.largos||{})},servicios:d.config?.servicios?.length?d.config.servicios:BASE.servicios,extras:d.config?.extras?.length?d.config.extras:BASE.extras}}:fresh()}catch{return fresh()}}
-function save(){localStorage.setItem(KEY,JSON.stringify(data))}
+function save(){
+  localStorage.setItem(KEY,JSON.stringify(data));
+  if(cloudReady&&!suppressCloudWrite&&cloudDoc){
+    showSync("Guardando en la nube…");
+    cloudDoc.set({payload:data,updatedAt:firebase.firestore.FieldValue.serverTimestamp()})
+      .then(()=>showSync("Sincronizado",false,1100))
+      .catch(error=>{console.error(error);showSync("No se pudo sincronizar",true,3500)});
+  }
+}
 function migrate(){if(!data.citas.length){try{const v2=JSON.parse(localStorage.getItem("yvaStudioDatosV2")||"null"),old=JSON.parse(localStorage.getItem("citas")||"[]");if(v2?.citas?.length)data.citas=v2.citas;else if(Array.isArray(old))data.citas=old}catch{}}data.citas=data.citas.map(c=>({id:Number(c.id)||id(),nombre:String(c.nombre||"").trim(),fecha:c.fecha||"",hora:c.hora||"09:00",servicio:c.servicio||"Builder Gel",total:Number(c.total||0),notas:c.notas||"",cumpleanos:c.cumpleanos||"",estado:["pendiente","completada","cancelada"].includes(c.estado)?c.estado:"pendiente",fechaCompletada:c.fechaCompletada||null,mantenimientoAgendado:c.mantenimientoAgendado===true,citaOrigenId:c.citaOrigenId||null}));save()}
 function ensureDefaults(){data.config.descuentoCumple=Number(data.config.descuentoCumple??10);BASE.servicios.forEach(base=>{if(!data.config.servicios.some(s=>s.id===base.id||s.nombre.toLowerCase()===base.nombre.toLowerCase()))data.config.servicios.push(JSON.parse(JSON.stringify(base)))});BASE.extras.forEach(base=>{if(!data.config.extras.some(x=>x.id===base.id||x.nombre.toLowerCase()===base.nombre.toLowerCase()))data.config.extras.push(JSON.parse(JSON.stringify(base)))});save()}
+
+function bindAuthentication(){
+  $("loginForm").addEventListener("submit",async event=>{
+    event.preventDefault();
+    $("loginError").textContent="";
+    $("loginButton").disabled=true;
+    $("loginButton").textContent="Ingresando…";
+    try{
+      await auth.signInWithEmailAndPassword(val("loginEmail").trim(),val("loginPassword"));
+    }catch(error){
+      console.error(error);
+      $("loginError").textContent="No pude iniciar sesión. Revisa el correo y la contraseña.";
+    }finally{
+      $("loginButton").disabled=false;
+      $("loginButton").textContent="Iniciar sesión";
+    }
+  });
+  $("logoutBtn").addEventListener("click",()=>auth?.signOut());
+}
+function initializeFirebase(){
+  try{
+    if(!firebase.apps.length)firebase.initializeApp(FIREBASE_CONFIG);
+    auth=firebase.auth();db=firebase.firestore();cloudDoc=db.doc(CLOUD_DOC_PATH);
+    auth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(console.error);
+    auth.onAuthStateChanged(async user=>{
+      if(!user){
+        cloudReady=false;if(cloudUnsubscribe){cloudUnsubscribe();cloudUnsubscribe=null}
+        document.body.classList.add("app-locked");$("loginScreen").classList.remove("oculto");return;
+      }
+      if(user.uid!==ALLOWED_UID){
+        await auth.signOut();$("loginError").textContent="Esta cuenta no tiene permiso para abrir YVA STUDIO.";return;
+      }
+      document.body.classList.remove("app-locked");$("loginScreen").classList.add("oculto");
+      startCloudSync();
+    });
+  }catch(error){console.error(error);$("loginError").textContent="Firebase no pudo iniciarse. Revisa tu conexión."}
+}
+async function startCloudSync(){
+  showSync("Conectando con Firebase…");
+  const first=await cloudDoc.get();
+  if(!first.exists){
+    const hasLocal=data.citas.length>0;
+    if(hasLocal&&confirm(`Encontré ${data.citas.length} citas guardadas en este dispositivo. ¿Subirlas a Firebase?`)){
+      await cloudDoc.set({payload:data,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+    }else{
+      data=fresh();await cloudDoc.set({payload:data,updatedAt:firebase.firestore.FieldValue.serverTimestamp()});
+    }
+  }
+  if(cloudUnsubscribe)cloudUnsubscribe();
+  cloudUnsubscribe=cloudDoc.onSnapshot(snapshot=>{
+    const remote=snapshot.data()?.payload;if(!remote)return;
+    suppressCloudWrite=true;data=normalizeCloudData(remote);localStorage.setItem(KEY,JSON.stringify(data));ensureDefaults();loadConfig();fillServices();refresh();suppressCloudWrite=false;cloudReady=true;showSync("Sincronizado",false,1000);
+  },error=>{console.error(error);showSync("Error de sincronización",true,4000)});
+}
+function normalizeCloudData(remote){
+  return {citas:Array.isArray(remote.citas)?remote.citas:[],config:{...BASE,...(remote.config||{}),largos:{...BASE.largos,...(remote.config?.largos||{})},servicios:remote.config?.servicios?.length?remote.config.servicios:JSON.parse(JSON.stringify(BASE.servicios)),extras:remote.config?.extras?.length?remote.config.extras:JSON.parse(JSON.stringify(BASE.extras))}};
+}
+function showSync(message,isError=false,duration=0){
+  const box=$("syncStatus");box.textContent=message;box.classList.add("visible");box.classList.toggle("error",isError);
+  if(duration)setTimeout(()=>box.classList.remove("visible"),duration);
+}
 function bind(){document.querySelectorAll(".nav-btn").forEach(b=>b.onclick=()=>show(b.dataset.page));["topNew","dashNew","agendaNew"].forEach(x=>$(x).onclick=()=>openNew());$("closeAppointment").onclick=$("cancelAppointment").onclick=closeAppointment;$("appointmentForm").onsubmit=saveAppointment;$("appointmentModal").onclick=e=>{if(e.target.id==="appointmentModal")closeAppointment()};$("closeHistory").onclick=closeHistory;$("historyModal").onclick=e=>{if(e.target.id==="historyModal")closeHistory()};$("clientSearch").oninput=renderClients;$("fortnightSelect").onchange=renderFinance;$("addService").onclick=addService;$("addExtra").onclick=addExtra;$("quoteToAppointment").onclick=quoteToAppointment;$("clearCalc").onclick=clearCalc;$("saveConfig").onclick=saveConfig;$("exportData").onclick=exportData;$("resetCatalog").onclick=resetCatalog;$("deleteAll").onclick=deleteAll;["calcService","calcLength","manualExtra","discount","birthdayDiscount"].forEach(x=>$(x).oninput=calculate)}
 function show(p){document.querySelectorAll(".page").forEach(x=>x.classList.remove("active"));document.querySelectorAll(".nav-btn").forEach(x=>x.classList.remove("active"));$(p)?.classList.add("active");document.querySelector(`[data-page="${p}"]`)?.classList.add("active");$("pageTitle").textContent={dashboard:"Dashboard",agenda:"Agenda",clientes:"Clientas",recordatorios:"Recordatorios",finanzas:"Finanzas",calculadora:"Calculadora",configuracion:"Configuración"}[p]||"YVA STUDIO";if(p==="agenda"&&calendar)setTimeout(()=>calendar.updateSize(),100);if(p==="clientes")renderClients();if(p==="finanzas")renderFinance();if(p==="calculadora"){renderCatalog();calculate()}}
 function initCalendar(){calendar=new FullCalendar.Calendar($("calendar"),{locale:"es",initialView:"dayGridMonth",height:"auto",headerToolbar:{left:"prev,next today",center:"title",right:"dayGridMonth,timeGridWeek,timeGridDay"},buttonText:{today:"Hoy",month:"Mes",week:"Semana",day:"Día"},events:events(),eventClick:i=>editAppointment(Number(i.event.id)),dateClick:i=>openNew(i.dateStr)});calendar.render()}
